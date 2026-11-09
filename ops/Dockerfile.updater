@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# Imagem do JOB de atualizacao automatica do Radar ENEM.
+#
+# Este NAO e o servidor da API. E a imagem que o Azure Container Apps Job executa
+# de forma agendada para rodar ops/atualizar-dados.sh: checar o INEP, ingerir o
+# que mudou e, se a Prata mudou, disparar o rebuild da imagem da API via ACR.
+#
+# Base: a imagem oficial do Azure CLI (mcr.microsoft.com/azure-cli), que ja traz
+# 'az' + Python. Assim o job faz 'az acr build' (build server-side, sem daemon
+# Docker) e tambem roda o pacote radar-etl. Nao precisamos de Docker aqui — essa
+# e a razao de usar ACR Tasks em vez de docker build.
+#
+# Build (contexto = raiz do repo, para enxergar pipeline/ e ops/):
+#   az acr build -r <ACR> -t radar-updater:v1 -f ops/Dockerfile.updater .
+# =============================================================================
+FROM mcr.microsoft.com/azure-cli:latest
+
+# A base e Alpine. 'curl' (usado no smoke-test do script) e 'bash' podem faltar;
+# garantimos os dois. git entra para 'az acr build' empacotar o contexto local.
+RUN apk add --no-cache bash curl git
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /repo
+
+# Instala o pacote radar-etl (CLI 'radar-etl'). Copiamos so o pipeline para a
+# instalacao ficar em cache enquanto o resto do repo muda.
+COPY pipeline/pyproject.toml pipeline/pyproject.toml
+COPY pipeline/src pipeline/src
+RUN pip install ./pipeline && radar-etl --help >/dev/null
+
+# O restante do repo (ops/, api/ com os dois Dockerfiles, contratos) e necessario
+# em runtime: o script constroi a imagem da API a partir de api/*. data/ fica de
+# fora da imagem (ver .dockerignore) — a silver/bronze vivem num volume montado
+# em runtime, nao dentro desta imagem.
+COPY ops ops
+COPY api api
+COPY deploy.sh deploy.sh
+
+# O ciclo inteiro vive no script. O Job sobrescreve o comando se precisar, mas o
+# default ja faz a coisa certa: detectar + ingerir + (se mudou) rebuild/deploy.
+ENTRYPOINT ["bash", "ops/atualizar-dados.sh"]

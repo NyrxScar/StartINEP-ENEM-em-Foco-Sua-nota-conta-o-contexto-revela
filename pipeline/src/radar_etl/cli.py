@@ -70,3 +70,103 @@ def inspecionar(
                 rotulo = "cabecalho" if numero == 0 else f"linha {numero}"
                 typer.echo(f"    [{rotulo}] {linha[:400]}")
             break
+
+
+@app.command("atualizar-auto")
+def atualizar_auto(
+    raiz: Path = typer.Option(Path("../data"), help="Raiz das camadas de dados."),  # noqa: B008
+    ano: list[int] = typer.Option(  # noqa: B008
+        None,
+        "--ano",
+        help="Forca um ano especifico (repetivel). Sem isso, usa o ano corrente e o anterior.",
+    ),
+) -> None:
+    """Checa o INEP e ingere so o que mudou, para o ano corrente e o anterior.
+
+    Projetado para rodar sem humano (Azure Container Apps Job agendado). Nunca
+    aborta por causa de um ano: avalia todos e resume ao final. O codigo de saida
+    comunica ao orquestrador o que fazer a seguir:
+
+      0  nada mudou OU alguma edicao foi processada com sucesso (ver 'prata_mudou')
+      3  pelo menos uma edicao precisa de um contrato novo/ajustado (acao humana)
+      1  erro de verdade (rede/TLS/qualidade) em pelo menos uma edicao
+
+    A linha 'PRATA_MUDOU=sim|nao' no stdout e o contrato com o script de deploy:
+    ele so rebuilda a imagem quando houve mudanca real na Prata.
+    """
+    from radar_etl.auto import Desfecho, anos_alvo, atualizar_ano
+    from radar_etl.pipeline import Caminhos
+
+    caminhos = Caminhos(raiz=raiz)
+    alvos = ano or anos_alvo()
+
+    resultados = [atualizar_ano(e, caminhos) for e in alvos]
+
+    typer.echo("=== Atualizacao automatica ENEM ===")
+    for r in resultados:
+        typer.echo(f"  [{r.edicao}] {r.desfecho.value}: {r.detalhe}")
+
+    prata_mudou = any(r.prata_mudou for r in resultados)
+    typer.echo(f"PRATA_MUDOU={'sim' if prata_mudou else 'nao'}")
+
+    precisa_contrato = any(r.desfecho is Desfecho.CONTRATO_AUSENTE for r in resultados)
+    houve_erro = any(r.desfecho in (Desfecho.ERRO, Desfecho.REPROVADA) for r in resultados)
+
+    if houve_erro:
+        falhos = (Desfecho.ERRO, Desfecho.REPROVADA)
+        anos_erro = [r.edicao for r in resultados if r.desfecho in falhos]
+        typer.echo(f"[ERRO] Falha em: {anos_erro}", err=True)
+        raise typer.Exit(code=1)
+
+    if precisa_contrato:
+        anos_sem = [r.edicao for r in resultados if r.desfecho is Desfecho.CONTRATO_AUSENTE]
+        typer.echo(
+            f"[ACAO HUMANA] Edicao(oes) {anos_sem} na origem sem contrato valido. "
+            f"Rode 'radar-etl rascunho-contrato --edicao <ANO>' e revise o YAML.",
+            err=True,
+        )
+        raise typer.Exit(code=3)
+
+    raise typer.Exit(code=0)
+
+
+@app.command("rascunho-contrato")
+def rascunho_contrato(
+    edicao: int = typer.Option(..., help="Ano da edicao sem contrato ou com estrutura nova."),
+    raiz: Path = typer.Option(Path("../data"), help="Raiz das camadas de dados."),  # noqa: B008
+) -> None:
+    """Baixa o ZIP da edicao e gera um contrato-RASCUNHO para revisao humana.
+
+    Use quando 'atualizar-auto' sinaliza CONTRATO_AUSENTE: o INEP publicou um ano
+    (ou mudou a estrutura do ZIP) e nao ha como ingerir sem um contrato. Este comando
+    inspeciona o ZIP, casa as colunas conhecidas, e escreve enem_<ANO>.rascunho.yml.
+    O rascunho NAO e usado como contrato ate alguem revisa-lo e renomea-lo para
+    enem_<ANO>.yml.
+    """
+    from radar_etl.extract.fonte import baixar
+    from radar_etl.pipeline import Caminhos
+    from radar_etl.rascunho import RascunhoImpossivel, salvar_rascunho
+
+    caminhos = Caminhos(raiz=raiz)
+    zip_path = caminhos.bronze / f"microdados_enem_{edicao}.zip"
+    url = f"https://download.inep.gov.br/microdados/microdados_enem_{edicao}.zip"
+
+    if not zip_path.exists():
+        typer.echo(f"Baixando {url} ...")
+        try:
+            baixar(url, zip_path)
+        except Exception as erro:  # noqa: BLE001
+            typer.echo(f"[ERRO] Nao consegui baixar o ZIP de {edicao}: {erro}", err=True)
+            raise typer.Exit(code=1) from erro
+
+    try:
+        destino = salvar_rascunho(edicao, zip_path)
+    except RascunhoImpossivel as erro:
+        typer.echo(f"[ERRO] {erro}", err=True)
+        raise typer.Exit(code=1) from erro
+
+    typer.echo(f"[ok] Rascunho escrito em {destino}")
+    typer.echo(
+        "Revise o arquivo, ajuste as entradas marcadas com REVISAR, e renomeie para "
+        f"enem_{edicao}.yml para ativar o contrato."
+    )
