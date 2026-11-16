@@ -1,0 +1,168 @@
+name: Atualização automática dos dados do ENEM
+
+# Mantém a camada silver em dia com o INEP e deixa uma imagem nova da API pronta
+# no registry, SEM precisar logar no Azure (o plano estudante não permite criar
+# service principal). O login é feito só no Docker/registry, com a senha do ACR.
+#
+# Divisão de trabalho (Opção 2):
+#   - Este workflow (automático): checa o INEP, ingere o que mudou, builda a
+#     imagem da API com os dados e dá PUSH no ACR. Commita a silver atualizada.
+#     Quando publica uma imagem nova, abre uma ISSUE avisando.
+#   - Você (um comando): ao ver o aviso, roda `./deploy.sh api` para colocar a
+#     imagem nova no ar. Esse passo precisa de `az login`, que só você tem.
+#
+# Ano novo com estrutura diferente -> gera contrato-rascunho e abre Pull Request
+# pedindo revisão humana (o pipeline não adivinha mapeamento de colunas).
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # toda segunda, 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: atualizar-dados-enem
+  cancel-in-progress: false
+
+jobs:
+  atualizar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Instalar Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar o pipeline (radar-etl)
+        run: pip install ./pipeline
+
+      # ---------------------------------------------------------------------
+      # Passo 1 — detectar + ingerir.
+      #   0 = ok (ver prata_mudou)   3 = precisa contrato (PR)   1 = erro (falha)
+      # ---------------------------------------------------------------------
+      - name: Checar o INEP e ingerir o que mudou
+        id: ingestao
+        run: |
+          set +e
+          SAIDA=$(cd pipeline && radar-etl atualizar-auto --raiz ../data 2>&1)
+          COD=$?
+          set -e
+          echo "$SAIDA"
+          PRATA_MUDOU=$(echo "$SAIDA" | sed -n 's/^PRATA_MUDOU=//p' | tail -1)
+          echo "cod=$COD" >> "$GITHUB_OUTPUT"
+          echo "prata_mudou=${PRATA_MUDOU:-nao}" >> "$GITHUB_OUTPUT"
+          ANOS=$(echo "$SAIDA" | sed -n 's/.*\[\([0-9]\{4\}\)\] contrato_ausente.*/\1/p' | tr '\n' ' ')
+          echo "anos_sem_contrato=$ANOS" >> "$GITHUB_OUTPUT"
+          if [ "$COD" -eq 1 ]; then exit 1; fi
+
+      # ---------------------------------------------------------------------
+      # CAMINHO A — novidade real: build + push da imagem para o ACR.
+      # Login SÓ no Docker/registry (senha do ACR). Nada de `az login`.
+      # ---------------------------------------------------------------------
+      - name: Login no Docker (ACR)
+        if: steps.ingestao.outputs.prata_mudou == 'sim'
+        run: |
+          echo "${{ secrets.ACR_PASSWORD }}" \
+            | docker login "${{ secrets.ACR_LOGIN_SERVER }}" \
+                -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+
+      - name: Build + push da imagem da API (com dados)
+        id: build
+        if: steps.ingestao.outputs.prata_mudou == 'sim'
+        run: |
+          SERVER="${{ secrets.ACR_LOGIN_SERVER }}"
+          USER="${{ secrets.ACR_USERNAME }}"
+          PASS="${{ secrets.ACR_PASSWORD }}"
+
+          # Próxima versão vN+1 lendo as tags via API REST do registry (não há
+          # `az` logado no Azure aqui). Autentica com Basic (usuário/senha do ACR).
+          TAGS=$(curl -s -u "$USER:$PASS" \
+            "https://$SERVER/v2/radar-api-comdados/tags/list" || echo '{}')
+          MAIOR=$(echo "$TAGS" | grep -oE '"v[0-9]+"' | tr -d '"v' | sort -n | tail -1 || true)
+          if [ -z "$MAIOR" ]; then VER=v1; else VER="v$((MAIOR + 1))"; fi
+          echo "Nova versão: $VER"
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+
+          docker build -t "$SERVER/radar-api:$VER" -f api/Dockerfile api/
+          docker build --build-arg BASE_IMAGE="$SERVER/radar-api:$VER" \
+            -t "$SERVER/radar-api-comdados:$VER" -f api/Dockerfile.comdados .
+          docker push "$SERVER/radar-api:$VER"
+          docker push "$SERVER/radar-api-comdados:$VER"
+
+      - name: Commitar a silver e os manifestos atualizados
+        if: steps.ingestao.outputs.prata_mudou == 'sim'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f data/silver data/_manifests 2>/dev/null || git add -f data/silver
+          if git diff --cached --quiet; then
+            echo "Nada a commitar."
+          else
+            git commit -m "chore(dados): atualização automática da silver do ENEM [skip ci]"
+            git push
+          fi
+
+      - name: Abrir issue avisando que há imagem nova para publicar
+        if: steps.ingestao.outputs.prata_mudou == 'sim'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const ver = "${{ steps.build.outputs.ver }}";
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Dados do ENEM atualizados — publicar imagem ${ver}`,
+              body: [
+                `O robô ingeriu dados novos do INEP e já publicou a imagem **radar-api-comdados:${ver}** no registry.`,
+                ``,
+                `Para colocar no ar, rode na raiz do projeto (com \`az login\` feito):`,
+                ``,
+                "```bash",
+                `./deploy.sh api`,
+                "```",
+                ``,
+                `Ou aponte direto para esta versão:`,
+                "```bash",
+                `source .azure-deploy-vars.sh`,
+                `ACR_SERVER=$(az acr show -n "$ACR" --query loginServer -o tsv)`,
+                `az containerapp update -n "$API_APP" -g "$RG" --image "$ACR_SERVER/radar-api-comdados:${ver}"`,
+                "```",
+              ].join("\n"),
+            });
+
+      # ---------------------------------------------------------------------
+      # CAMINHO B — ano novo sem contrato: gera rascunho e abre PR.
+      # ---------------------------------------------------------------------
+      - name: Gerar contrato-rascunho (ano novo)
+        if: steps.ingestao.outputs.cod == '3'
+        run: |
+          for ano in ${{ steps.ingestao.outputs.anos_sem_contrato }}; do
+            echo "Gerando rascunho para $ano..."
+            (cd pipeline && radar-etl rascunho-contrato --edicao "$ano" --raiz ../data) || true
+          done
+
+      - name: Abrir Pull Request pedindo revisão do contrato
+        if: steps.ingestao.outputs.cod == '3'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "feat(dados): rascunho de contrato para edição nova do ENEM"
+          branch: auto/contrato-rascunho
+          title: "Revisão necessária: contrato para edição nova do ENEM"
+          body: |
+            O INEP publicou uma edição que o pipeline ainda não sabe ingerir
+            (coluna/arquivo novo). Foi gerado um contrato-rascunho
+            (`enem_<ANO>.rascunho.yml`).
+
+            **Ação necessária:** revise as entradas marcadas com `REVISAR`,
+            ajuste o mapeamento de colunas e renomeie para `enem_<ANO>.yml`.
+            Ao fazer merge, a próxima execução agendada ingere a edição.
+          add-paths: |
+            pipeline/**
+            data/**

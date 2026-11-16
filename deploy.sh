@@ -151,20 +151,48 @@ mostrar_status() {
   testar_web || true
 }
 
+# --- Publicar a imagem que o robô já deixou pronta (NÃO rebuilda) ------------
+# Usado quando o GitHub Actions ingeriu dados novos e deu push de uma tag nova
+# de radar-api-comdados. Aqui só apontamos o Container App para a última tag vN.
+publicar_ultima() {
+  local maior ver
+  maior=$(az acr repository show-tags -n "$ACR" --repository radar-api-comdados -o tsv 2>/dev/null \
+          | grep -E '^v[0-9]+$' | sed 's/^v//' | sort -n | tail -1 || true)
+  if [ -z "$maior" ]; then erro "Nenhuma tag vN encontrada em radar-api-comdados."; exit 1; fi
+  ver="v$maior"
+  local atual
+  atual=$(az containerapp show -n "$API_APP" -g "$RG" \
+          --query "properties.template.containers[0].image" -o tsv 2>/dev/null)
+  info "Imagem mais recente no registry: radar-api-comdados:$ver"
+  info "Imagem no ar agora: $atual"
+  if echo "$atual" | grep -q ":$ver$"; then
+    ok "A API já está rodando a $ver. Nada a publicar."
+    return 0
+  fi
+  info "Publicando radar-api-comdados:$ver no Container App '$API_APP'..."
+  az containerapp update -n "$API_APP" -g "$RG" \
+    --image "$ACR_SERVER/radar-api-comdados:$ver" --query "properties.provisioningState" -o tsv
+  ok "Publicado $ver."
+  testar_api || true
+}
+
 # --- Main --------------------------------------------------------------------
 ALVO="${1:-}"
 case "$ALVO" in
-  api)    resolver_acr; login_docker; deploy_api ;;
-  web)    resolver_acr; login_docker; deploy_web ;;
-  all)    resolver_acr; login_docker; deploy_api; deploy_web ;;
-  status) resolver_acr; mostrar_status ;;
+  api)      resolver_acr; login_docker; deploy_api ;;
+  web)      resolver_acr; login_docker; deploy_web ;;
+  all)      resolver_acr; login_docker; deploy_api; deploy_web ;;
+  publicar) resolver_acr; publicar_ultima ;;
+  status)   resolver_acr; mostrar_status ;;
   *)
-    echo "Uso: ./deploy.sh {api|web|all|status}"
+    echo "Uso: ./deploy.sh {api|web|all|publicar|status}"
     echo
-    echo "  api     rebuilda e atualiza o backend (API + dados silver)"
-    echo "  web     rebuilda e atualiza o frontend (site)"
-    echo "  all     atualiza os dois"
-    echo "  status  mostra as imagens no ar e testa os endpoints (não muda nada)"
+    echo "  api       rebuilda e atualiza o backend (API + dados silver)"
+    echo "  web       rebuilda e atualiza o frontend (site)"
+    echo "  all       atualiza os dois"
+    echo "  publicar  põe no ar a última imagem que o robô (GitHub Actions) deixou"
+    echo "            pronta no registry, SEM rebuildar. Use quando a issue avisar."
+    echo "  status    mostra as imagens no ar e testa os endpoints (não muda nada)"
     exit 1
     ;;
 esac
